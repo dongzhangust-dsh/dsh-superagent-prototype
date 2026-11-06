@@ -325,6 +325,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'need a decision', human_action: 'Desktop too?' })
   expect(runtime.store.tickets.get(ticket.id)!.attention).toMatchObject({ question: 'Desktop too?' })
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_attention', ticket: { ticket_id: ticket.id, attention: { question: 'Desktop too?' } } })
+  await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', text: 'x' })).rejects.toThrow()
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'other', text: 'x' })).rejects.toThrow('current attention question')
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })).toEqual({ status: 'sent' })
   await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'pr open', pr_number: 42, human_action: null })
@@ -762,10 +763,42 @@ it('asks a question where the human message that raised it was written, not in t
   const queued = vi.spyOn(runtime.outbox, 'send')
   await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Keep the PR and record the reason in a follow-up?', text: 'Keep the PR and record the reason in a follow-up?' })
   expect(queued.mock.calls.at(-1)![0].channel).toEqual(review.channel)
-  // A question about the ticket as a whole still goes to where the ticket started.
-  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'y', human_action: 'Desktop too?' })
-  await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: 'Desktop too?', text: '要不要也改桌面端？' })
+  const first = runtime.store.tickets.get(ticket.id)!.attention!
+  // Omitting the question preserves both its identity and origin.
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'still working' })
+  expect(runtime.store.tickets.get(ticket.id)!.attention).toEqual(first)
+  // The same question with no origin is a new request for the ticket's original conversation.
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'y', human_action: first.question })
+  const second = runtime.store.tickets.get(ticket.id)!.attention!
+  expect(second.id).not.toBe(first.id)
+  expect(second.triggerId).toBeUndefined()
+  await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: first.question, text: first.question })
   expect(queued.mock.calls.at(-1)![0].channel).toEqual(trigger.channel)
+  // Repeating the same question and origin keeps the request idempotent.
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'unchanged', human_action: first.question })
+  expect(runtime.store.tickets.get(ticket.id)!.attention).toEqual(second)
+  // A new originating message with identical text receives a fresh reply too.
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'review asks again', human_action: first.question, question_for_trigger_id: review.id })
+  const third = runtime.store.tickets.get(ticket.id)!.attention!
+  expect(third.id).not.toBe(first.id)
+  expect(third.id).not.toBe(second.id)
+  await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'attention', human_action: first.question, text: first.question })
+  expect(queued.mock.calls.at(-1)![0].channel).toEqual(review.channel)
+})
+
+it('withdraws a queued attention reply when the same question changes origin', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  subscribe(ticket.id, { source: 'github', id: '42' })
+  const review = commentTrigger({ id: 6, body: 'Please decide', user: { login: 'alice' }, html_url: 'https://github.com/acme/widgets/pull/42#issuecomment-6', created_at: '2026-09-09T00:02:00Z' }, { number: 42, isPr: true }, 'conversation', 'agent-bot')
+  await receive(review)
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'decision needed', human_action: 'Keep it?' })
+  const queued = runtime.engine.reply({ purpose: 'attention', ticketId: ticket.id, question: 'Keep it?', text: 'Keep it?' })
+  expect(runtime.outbox.status(queued.id)).toBe('pending')
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'review asks', human_action: 'Keep it?', question_for_trigger_id: review.id })
+  expect(runtime.outbox.status(queued.id)).toBeUndefined()
+  const replacement = runtime.engine.reply({ purpose: 'attention', ticketId: ticket.id, question: 'Keep it?', text: 'Keep it?' })
+  expect(replacement.id).not.toBe(queued.id)
+  expect(runtime.outbox.status(replacement.id)).toBe('pending')
 })
 
 it('finds triggers by #PR number, GitHub link prefix and Feishu message id', async () => {

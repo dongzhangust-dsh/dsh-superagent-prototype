@@ -304,6 +304,7 @@ function failures(): Map<string, string> {
   const schemas = [...toolsOf('orchestrator').values(), ...toolsOf('worker').values()].map(tool => tool.parameters)
   walk(schemas, (node, property) => {
     if (property && Array.isArray(node.enum)) options.set(property, new Set([...options.get(property) ?? [], ...node.enum.map(String)]))
+    if (property && node.const !== undefined) options.set(property, new Set([...options.get(property) ?? [], String(node.const)]))
   })
   for (const name of ['decision', 'purpose', 'state']) expect(options.has(name), `${name} has options`).toBe(true)
   const tools = { orchestrator: new Set(toolsOf('orchestrator').keys()), worker: new Set(toolsOf('worker').keys()) }

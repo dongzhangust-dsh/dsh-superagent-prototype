@@ -18,6 +18,8 @@ export interface ExecutorToolsHost {
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
   sendReplies(): Promise<void>
+  /** Queue a private status notice in the report transaction when configured. */
+  privateReportNotice?(before: Ticket, after: Ticket): void
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
@@ -93,7 +95,9 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
+          const before = host.privateReportNotice ? structuredClone(host.store.tickets.get(ticketId)!) : undefined
           const updated = host.engine.report(ticketId, report)
+          if (before) host.privateReportNotice?.(before, updated)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'

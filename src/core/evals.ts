@@ -59,7 +59,12 @@ export class Evals extends EnginePart {
    */
   private expire(thread: Thread): void {
     const expired = (thread.expired ?? 0) + 1
-    if (expired > REQUEUES) { this.finish(thread, thread.evaluating!, { kind: 'unavailable', reason: [{ code: 'timeout' }] }); return }
+    if (expired > REQUEUES) {
+      const evaluation = thread.evaluating!
+      this.finish(thread, evaluation, { kind: 'unavailable', reason: [{ code: 'timeout' }] })
+      this.alertUnavailable(evaluation)
+      return
+    }
     const { id, triggerIds } = thread.evaluating!
     delete thread.evaluating
     thread.expired = expired
@@ -288,8 +293,12 @@ export class Evals extends EnginePart {
     }
     // An inferred candidate ignored without an assessment, from its card, says so beside the reason given.
     const unassessed = outcome.kind === 'ignore' && evaluation.strength !== 'explicit' && !outcome.audit ? [{ code: 'ignoredFromCard' }] : []
-    if (outcome.kind === 'ignore' || outcome.kind === 'unavailable') return this.finish(thread, evaluation, { kind: outcome.kind,
-      reason: [...unassessed, ...reasonOf(outcome.reason)], ...audit })
+    if (outcome.kind === 'ignore' || outcome.kind === 'unavailable') {
+      const active = thread.evaluating?.id === evaluation.id
+      const decision = this.finish(thread, evaluation, { kind: outcome.kind, reason: [...unassessed, ...reasonOf(outcome.reason)], ...audit })
+      if (active && outcome.kind === 'unavailable') this.alertUnavailable(evaluation)
+      return decision
+    }
     if (outcome.kind === 'stop') {
       const ticket = this.repo.tickets.get(outcome.ticketId)
       if (!ticket || !liveTicket(ticket)) return this.finish(thread, evaluation, { kind: 'ignore', reason: [{ code: 'stopUnknown' }],
@@ -301,6 +310,15 @@ export class Evals extends EnginePart {
       return decision
     }
     return this.accept(thread, evaluation, outcome)
+  }
+  /** Queue a terminal failure notice only to the explicit person's original source conversation. */
+  private alertUnavailable(evaluation: Evaluation): void {
+    const trigger = evaluation.primary ? this.repo.triggers.get(evaluation.primary) : undefined
+    if (evaluation.strength !== 'explicit' || !trigger?.human || !trigger.channel || trigger.source !== trigger.channel.source) return
+    const text = trigger.source === 'github' ? 'This is by an automated agent, not a human.\n\nI could not assess this request. Please try again later.'
+      : trigger.source === 'feishu' && trigger.meta.direct === true && trigger.channel.address.direct === 'true'
+        ? '抱歉，暂时无法处理这条请求。请稍后重试。' : undefined
+    if (text) this.options.outbox.send({ id: key('eval-timeout', evaluation.id), channel: trigger.channel, kind: 'reply', text })
   }
   /** Record an accept with the Mandate the Eval gives, and have Tickets create its ticket. */
   private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Decision {

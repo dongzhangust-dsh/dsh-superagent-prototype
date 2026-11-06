@@ -25,6 +25,12 @@ const FeishuConfigSchema = FeishuBotSchema.extend({
     .refine(chats => new Set(chats.map(chat => chat.chatId)).size === chats.length, 'Duplicate chat IDs')
     .default([]),
   directMessages: z.boolean().default(true),
+  notificationBindings: z.array(z.object({
+    github: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/),
+    openId: z.string().regex(/^ou_[a-zA-Z0-9]+$/),
+    messageId: z.string().regex(/^om_[a-zA-Z0-9]+$/),
+  }).strict()).refine(rows => new Set(rows.map(row => row.github.toLowerCase())).size === rows.length, 'Duplicate GitHub logins')
+    .refine(rows => new Set(rows.map(row => row.openId)).size === rows.length, 'Duplicate Feishu users').default([]),
   otherChats: z.enum(['none', 'mentions']).default('none'),
 }).strict()
 export type FeishuConfig = z.infer<typeof FeishuConfigSchema>
@@ -59,8 +65,12 @@ export const feishuKind: SourceKind<FeishuConfig> = {
   },
   // A reply goes only to a chat the Source still receives.
   channel: {
-    allowed: (address, config) =>
-      feishuKind.scope!({ meta: { chatId: address.chatId ?? '', direct: address.direct === 'true' } }, config).listened,
+    allowed: (address, config) => {
+      if (address.notification === 'true') return config.directMessages && address.direct === 'true'
+        && config.notificationBindings.some(row => row.github.toLowerCase() === address.github?.toLowerCase()
+          && row.openId === address.openId && row.messageId === address.messageId)
+      return feishuKind.scope!({ meta: { chatId: address.chatId ?? '', direct: address.direct === 'true' } }, config).listened
+    },
     send: sendFeishu, link: feishuLink,
   },
   threadContext: feishuThreadContext,

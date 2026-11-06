@@ -16,6 +16,14 @@ const words = (count: number) => Array.from({ length: count }, () => 'word').joi
 const read = (resource: string, page: { offset?: number; limit?: number } = {}) =>
   h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, ...page })
 
+it('exposes human_action as required for attention in the reply tool schema', () => {
+  const reply = h.tools.get(h.runtime.masterId)!.get('orchestrator_reply') as unknown as {
+    parameters: { oneOf?: { properties: { purpose: { const?: string } }; required: string[] }[] }
+  }
+  const attention = reply.parameters.oneOf?.find(branch => branch.properties.purpose.const === 'attention')
+  expect(attention?.required).toContain('human_action')
+})
+
 it('reads the lists, a ticket, a decision, the settings, the prompts and the models as resources', async () => {
   const { ticket, trigger } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
   await h.acceptedTicket(feishu('2', '@bot 再修一个'))

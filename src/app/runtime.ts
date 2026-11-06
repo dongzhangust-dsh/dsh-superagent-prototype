@@ -39,6 +39,8 @@ import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
 import { Setup } from './setup.ts'
 import { feishuSettings } from '../sources/feishu.ts'
+import { feishuPrivateNotice, feishuReportStatus } from '../sources/feishu-notification.ts'
+import { githubPage } from '../sources/github-trigger.ts'
 import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
 import { Sessions } from './sessions.ts'
 import { Settings } from './settings.ts'
@@ -132,6 +134,16 @@ export class Runtime extends Service implements SourceHost {
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
+      const privateNotice = (ticket: Ticket, eventId: string, text: string) => {
+        const origin = store.triggers.get(ticket.origin.triggerId)
+        if (!origin || origin.source !== 'github' || origin.actor.source !== 'github' || !origin.human || !setup.configured()
+          || !Number.isSafeInteger(origin.meta.number) || Number(origin.meta.number) <= 0
+          || !sources.scope(origin).listened || !sources.instance('feishu')?.enabled) return
+        const url = githubPage(setup.deployment.repository, Number(origin.meta.number), origin.meta.isPr === true)
+        const message = feishuPrivateNotice(feishuSettings(sources), id => store.triggers.get(id), origin.actor.id, eventId,
+          `[GitHub #${origin.meta.number}](${url}) ${text}.`, ticket.id)
+        if (message) outbox.send(message)
+      }
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
@@ -144,6 +156,10 @@ export class Runtime extends Service implements SourceHost {
           const followed = !this.quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')
           const followup = followed ? followupNotice(store, sources, event.data.triggerId) : undefined
           if (followup) sessions.relay(followup.id, followup.text)
+          if (event.type === 'ticket.resumed') {
+            const ticket = store.tickets.get(event.data.ticketId)
+            if (ticket) privateNotice(ticket, key('resumed', ticket.id, event.data.triggerId), 'has resumed')
+          }
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended && setup.configured()) {
@@ -162,6 +178,10 @@ export class Runtime extends Service implements SourceHost {
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
+        privateReportNotice: (before, after) => {
+          const status = feishuReportStatus(before, after)
+          if (status) privateNotice(after, status.id, status.text)
+        },
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
       this.ready = this.initialize()
     } catch (error) {

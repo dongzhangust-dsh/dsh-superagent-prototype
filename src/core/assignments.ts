@@ -1,7 +1,7 @@
 /** What the Executor and its workers report about the Assignments that run tickets. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
+import { latestAssignment, liveTicket, runningAssignment, waitsForPerson } from './model.ts'
 import type { ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -111,9 +111,11 @@ export class Assignments extends EnginePart {
     if (!assignment) throw new UserError('unknownAssignment')
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
     const at = this.now()
+    const priorReport = assignment.report
+    const wasWaiting = waitsForPerson(ticket)
     const previous = ticket.attention
-    const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
-    const asked = report.question && report.question !== previous?.question ? ask(report.question) : previous
+    const ask = (question: string) => ({ id: key('attention', ticketId, question, at, previous?.id ?? ''), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
+    const asked = report.question && (report.question !== previous?.question || report.askedBy !== previous?.triggerId) ? ask(report.question) : previous
     const attention = report.question === null || report.state === 'ready' ? undefined : asked
     if (attention) ticket.attention = attention
     else delete ticket.attention
@@ -125,6 +127,20 @@ export class Assignments extends EnginePart {
     if (report.answers) this.takeUp(ticketId, report.answers)
     if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
+    // Worker text has no destination-specific provenance, so it is never copied into an automatic notice.
+    if ((report.state === 'blocked' || report.state === 'failed')
+      && (!wasWaiting || priorReport?.state !== report.state)) {
+      const source = this.source(ticket)
+      const channel = source?.channel
+      // Feishu group conversations are not authorized for unsolicited status messages.
+      const allowed = channel?.source !== 'feishu' || (source?.source === 'feishu' && source.meta.direct === true && channel.address.direct === 'true')
+      if (channel && allowed) {
+        const prefix = channel.source === 'github' ? 'This is by an automated agent, not a human.\n\n' : ''
+        const text = report.state === 'blocked' ? 'The assignment is blocked.' : 'The assignment failed.'
+        this.options.outbox.send({ id: key('assignment-status', assignment.id, report.state, at, priorReport?.at ?? ''),
+          channel, text: prefix + text, kind: 'notice', ticketId })
+      }
+    }
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.
     const ready = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
     // A dropped report after a close the ticket deferred ends it as the close did, which its final notice tells.

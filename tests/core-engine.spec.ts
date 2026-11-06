@@ -151,6 +151,65 @@ describe('eval', () => {
     expect(decision.kind).toBe('unavailable')
     expect(h.repo.tickets.list()).toEqual([])
   })
+  it('queues one alert to the original explicit Feishu message only after assessment retries are exhausted', () => {
+    const h = harness()
+    const source = trigger('1', { source: 'feishu', threads: [{ source: 'feishu', id: 't1' }], meta: { direct: true },
+      channel: { source: 'feishu', thread: 't1', address: { message: 'original', direct: 'true' } } })
+    h.engine.receive(source); h.pump()
+    for (let attempt = 0; attempt < 3; attempt++) {
+      h.engine.candidateDelivered(h.requests.at(-1)!.evalId)
+      h.tick(61); h.pump()
+      if (attempt < 2) expect(h.outbox).toEqual([])
+    }
+    expect(h.outbox).toEqual([{ id: key('eval-timeout', h.requests.at(-1)!.evalId), channel: source.channel, kind: 'reply',
+      text: '抱歉，暂时无法处理这条请求。请稍后重试。' }])
+    h.pump()
+    expect(h.outbox).toHaveLength(1)
+  })
+  it('does not alert on inferred Feishu assessments or other sources', () => {
+    for (const inferred of [true, false]) {
+      const h = harness(inferred ? { gate: () => ({ admissible: true, strength: 'inferred', basis: { via: 'followup' } }) } : {})
+      const source = inferred ? trigger('1', { source: 'feishu', threads: [{ source: 'feishu', id: 't1' }], meta: { direct: true },
+        channel: { source: 'feishu', thread: 't1', address: { message: 'original', direct: 'true' } } }) : trigger('1')
+      h.engine.receive(source); h.pump()
+      for (let attempt = 0; attempt < 3; attempt++) { h.engine.candidateDelivered(h.requests.at(-1)!.evalId); h.tick(61); h.pump() }
+      expect(h.outbox).toEqual([])
+    }
+  })
+  it('alerts the original GitHub conversation on terminal unavailable, with an agent disclosure', () => {
+    for (const timeout of [true, false]) {
+      const h = harness()
+      const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+        channel: { source: 'github', thread: 'github:12', address: { number: '12', url: 'https://github.com/acme/repo/pull/12#discussion_r123' } } })
+      h.engine.receive(source); h.pump()
+      if (timeout) for (let attempt = 0; attempt < 3; attempt++) { h.engine.candidateDelivered(h.requests.at(-1)!.evalId); h.tick(61); h.pump() }
+      else h.decide(h.requests[0]!, { kind: 'unavailable', reason: 'internal reason must not leak' })
+      expect(h.outbox).toEqual([{ id: key('eval-timeout', h.requests.at(-1)!.evalId), channel: source.channel, kind: 'reply',
+        text: 'This is by an automated agent, not a human.\n\nI could not assess this request. Please try again later.' }])
+    }
+  })
+  it('does not alert GitHub for inferred assessments or policy changes', () => {
+    for (const inferred of [true, false]) {
+      const h = harness(inferred ? { gate: () => ({ admissible: true, strength: 'inferred', basis: { via: 'followup' } }) } : {})
+      const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+        channel: { source: 'github', thread: 'github:12', address: { number: '12' } } })
+      h.engine.receive(source); h.pump()
+      if (!inferred) h.setVersion('v2')
+      h.decide(h.requests[0]!, { kind: 'unavailable', reason: 'unavailable' })
+      expect(h.outbox).toEqual([])
+    }
+  })
+  it('never alerts a Feishu group or an ambiguous conversation', () => {
+    for (const [metaDirect, addressDirect] of [[false, 'false'], [true, 'false'], [false, 'true'], [undefined, undefined]] as const) {
+      const h = harness()
+      const source = trigger('1', { source: 'feishu', threads: [{ source: 'feishu', id: 't1' }],
+        meta: metaDirect === undefined ? {} : { direct: metaDirect },
+        channel: { source: 'feishu', thread: 't1', address: { message: 'original', ...(addressDirect === undefined ? {} : { direct: addressDirect }) } } })
+      h.engine.receive(source); h.pump()
+      for (let attempt = 0; attempt < 3; attempt++) { h.engine.candidateDelivered(h.requests.at(-1)!.evalId); h.tick(61); h.pump() }
+      expect(h.outbox).toEqual([])
+    }
+  })
   it('starts every pending eval in one step, so a second pump starts none of them again', () => {
     const h = harness()
     for (const [id, thread] of [['1', 'A'], ['2', 'B']] as const) h.engine.receive(trigger(id, { threads: [{ source: 'chat', id: thread }] }))
@@ -1598,6 +1657,51 @@ describe('read claims review: restarts', () => {
     expect(ticket().undelivered).toEqual([inputOf('2')])
   })
 })
+describe('automatic assignment status notices', () => {
+  it('queues one fixed notice per blocked or failed transition without exposing worker text', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'blocked', summary: 'private worker text' })
+    h.engine.report(ticketId, { state: 'blocked', summary: 'updated private text' })
+    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({
+      channel: trigger('1').channel, text: 'The assignment is blocked.', ticketId,
+    })])
+    h.tick(1); h.engine.report(ticketId, { state: 'failed', summary: 'secret error' })
+    expect(h.outbox.filter(item => item.kind === 'notice').map(item => item.text))
+      .toEqual(['The assignment is blocked.', 'The assignment failed.'])
+  })
+
+  it('uses the required GitHub prefix and never copies private report text', () => {
+    const h = harness()
+    const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+      channel: { source: 'github', thread: '12', address: { number: '12' } } })
+    h.engine.receive(source); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
+    h.settle(); h.engine.report(ticketId, { state: 'failed', summary: 'private Feishu content' })
+    expect(h.outbox.find(item => item.kind === 'notice')).toMatchObject({ channel: source.channel,
+      text: 'This is by an automated agent, not a human.\n\nThe assignment failed.' })
+  })
+
+  it('notifies on a blocked report with an attention question without exposing it', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'blocked', summary: 'blocked', question: 'Which page?' })
+    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({ text: 'The assignment is blocked.' })])
+  })
+
+  it('does not send automatic notices to Feishu groups or unverified direct channels', () => {
+    for (const direct of [false, true]) {
+      const h = harness()
+      const source = trigger('1', { source: 'feishu', threads: [{ source: 'feishu', id: 't1' }], meta: { direct },
+        channel: { source: 'feishu', thread: 't1', address: { direct: 'false' } } })
+      h.engine.receive(source); h.pump()
+      const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
+      h.settle(); h.engine.report(ticketId, { state: 'blocked', summary: 'private' })
+      expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([])
+    }
+  })
+})
+
 describe('ignores from the card', () => {
   const said = (text: string) => ({ code: 'said', values: { text } })
   it('marks the ignore of an inferred candidate that no assessment judged, unlike an assessed one or an explicit candidate\'s', () => {
