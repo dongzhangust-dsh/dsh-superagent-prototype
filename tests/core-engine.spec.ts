@@ -1348,9 +1348,10 @@ describe('gaps', () => {
     const sent = h.outbox.length
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ reused: false })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ reused: true })
+    expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done, rephrased' })).toMatchObject({ reused: false })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done, rephrased' })).toMatchObject({ reused: true })
-    expect(h.outbox).toHaveLength(sent + 1)
-    expect(h.outbox.at(-1)!.text).toBe('Done')
+    expect(h.outbox).toHaveLength(sent + 2)
+    expect(h.outbox.at(-1)!.text).toBe('Done, rephrased')
     // A later human follow-up creates a new assignment, which may publish its own result.
     h.tick(1); h.engine.receive(trigger('3')); h.settle()
     h.engine.report(ticketId, { state: 'ready', summary: 'Follow-up done' })

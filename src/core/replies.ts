@@ -80,10 +80,7 @@ export class Replies extends EnginePart {
     // Attention replies must match the ticket's currently open question text.
     if (request.purpose === 'attention' && (!attention || attention.question !== request.question)) throw new UserError('notAttention')
     if (request.purpose === 'answer' && !trigger?.human) throw new UserError('notQuestion')
-    // A result belongs to the assignment, not its wording: retries may rephrase it after delivery.
-    const id = attention ? key('attention-reply', attention.id)
-      : request.purpose === 'result' && ticket ? key('result-reply', ticket.id, latestAssignment(ticket)?.id ?? '')
-      : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
+    const id = attention ? key('attention-reply', attention.id) : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
     const existing = this.options.outbox.status(id)
     const ready = !ticket || !trigger || ticket.answers?.includes(trigger.id)
     if (request.purpose === 'answer' && !ready && !existing) throw new UserError('noAnswer')

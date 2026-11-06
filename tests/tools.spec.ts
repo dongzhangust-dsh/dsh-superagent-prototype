@@ -259,11 +259,8 @@ it('returns where a reply stands: sent, or dropped when its conversation can no 
   await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
   const reply = (text: string) => h.runTool(h.runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text })
   expect(await reply('修好了。')).toEqual({ status: 'sent' })
-  const second = await h.acceptedTicket(feishu('3', '@bot 修另一处回归'))
-  await h.runTool(second.sessionId, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
   vi.mocked(Commands.prototype.lark).mockRejectedValue(new CliError('the message was withdrawn', 230011))
-  expect(await h.runTool(h.runtime.masterId, 'orchestrator_reply', { ticket_id: second.ticket.id, purpose: 'result', text: '修好了，请看 PR。' }))
-    .toEqual({ status: 'dropped' })
+  expect(await reply('修好了，请看 PR。')).toEqual({ status: 'dropped' })
 })
 
 it('checks an acknowledgement against the IM word limit, not a character count', async () => {
