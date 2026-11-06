@@ -16,6 +16,7 @@ function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }:
   const repo = new MemoryRepositories()
   const outbox: OutboundMessage[] = []
   const withdrawn: string[] = []
+  const sent = new Set<string>()
   const requests: Candidate[] = []
   const assessor: Assessor = { request: vi.fn(candidate => { requests.push(candidate) }), release: vi.fn() }
   const launches: [Ticket, Assignment][] = []
@@ -37,7 +38,7 @@ function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }:
   const scope: EngineOptions['scope'] = { scope: t => t.meta.blocked ? { listened: false, reason: 'chat not allowed' } : { listened: true, observed: false } }
   const queued: EngineOptions['outbox'] = {
     send: message => { if (!outbox.some(item => item.id === message.id)) outbox.push(message) },
-    status: id => outbox.some(item => item.id === id) ? 'pending' : undefined,
+    status: id => sent.has(id) ? 'sent' : outbox.some(item => item.id === id) ? 'pending' : undefined,
     withdraw: id => { withdrawn.push(id) },
   }
   const engine = new Engine({ repo, scope, policy: () => policy, assessor, executor, outbox: queued,
@@ -61,7 +62,7 @@ function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }:
   const read = (ticketId: string) => engine.inputsRead(ticketId, repo.tickets.get(ticketId)!.inputs.flatMap(input =>
     input.kind === 'trigger' && input.readAt === null ? [input.id] : []))
   const decide = (candidate: Candidate, outcome: Outcome) => engine.decide(candidate.triggers[0]!.id, { ...outcome, evalId: candidate.evalId })
-  return { repo, engine, outbox, withdrawn, requests, assessor, executor, delivered, settle, pump, read, decide,
+  return { repo, engine, outbox, withdrawn, sent, requests, assessor, executor, delivered, settle, pump, read, decide,
     setVersion: (value: string) => { version = value }, setPaused: (value: boolean) => { paused = value }, tick: (seconds: number) => { clock += seconds } }
 }
 function accepted(h: ReturnType<typeof harness>, id = '1', thread = 't1') {
@@ -846,10 +847,11 @@ describe('worker reports', () => {
     expect(replaced.attention).toMatchObject({ question: 'Which size?' })
     expect(replaced.attention).not.toHaveProperty('triggerId')
     // The replaced question is withdrawn from the outbox if its message has not gone out yet.
-    expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id)])
+    expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-unverified', asked.attention!.id)])
     const cleared = h.engine.report(ticketId, { state: 'progress', summary: 'answered', question: null })
     expect(cleared).not.toHaveProperty('attention')
-    expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-reply', replaced.attention!.id)])
+    expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-unverified', asked.attention!.id),
+      key('attention-reply', replaced.attention!.id), key('attention-unverified', replaced.attention!.id)])
   })
   it('ends the ticket on a final report: dropped drops it, ready completes it unless it follows a Source\'s Thread that is open', () => {
     const outcome = (state: 'ready' | 'dropped' | 'failed', follows: boolean, closed = false) => {
@@ -1346,7 +1348,13 @@ describe('gaps', () => {
     const sent = h.outbox.length
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ reused: false })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ reused: true })
+    expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done, rephrased' })).toMatchObject({ reused: true })
     expect(h.outbox).toHaveLength(sent + 1)
+    expect(h.outbox.at(-1)!.text).toBe('Done')
+    // A later human follow-up creates a new assignment, which may publish its own result.
+    h.tick(1); h.engine.receive(trigger('3')); h.settle()
+    h.engine.report(ticketId, { state: 'ready', summary: 'Follow-up done' })
+    expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Follow-up done' })).toMatchObject({ reused: false })
     // A ticket whose PR closed unmerged, or that a person stopped, has no result to send.
     const closed = accepted(h, '5', 't5').ticketId!
     h.engine.bindThread(closed, { source: 'gh', id: 'pr-1' }, true)
@@ -1707,7 +1715,7 @@ describe('automatic assignment status notices', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'blocked', summary: 'blocked', question: 'Which page?' })
-    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({ text: expect.stringContaining('Human question: reported.') })])
+    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({ text: expect.stringContaining('Human question: reported.\nThe specific question needs verification; reply here to follow up.') })])
   })
 
   it('sends an explicitly public source question once using the existing attention key', () => {
@@ -1729,6 +1737,40 @@ describe('automatic assignment status notices', () => {
     expect(replies()[0]!.text).not.toContain('Supervisor question')
   })
 
+  it('deduplicates and withdraws progress question fallbacks while allowing a later public question', () => {
+    const h = harness()
+    const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+      channel: { source: 'github', thread: '12', address: { number: '12' } } })
+    h.engine.receive(source); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
+    h.settle()
+    const report = { state: 'progress' as const, summary: 'private', question: 'Which version should we use?' }
+    const attention = h.engine.report(ticketId, report).attention!
+    h.engine.report(ticketId, report)
+    const fallback = key('attention-unverified', attention.id)
+    expect(h.outbox.filter(item => item.id === fallback)).toEqual([expect.objectContaining({ channel: source.channel,
+      text: expect.stringContaining('The specific question needs verification; reply here to follow up.') })])
+    expect(h.outbox.map(item => item.text).join(' ')).not.toContain(report.question)
+    h.sent.add(fallback)
+    h.engine.report(ticketId, report)
+    expect(h.outbox.filter(item => item.id === fallback)).toHaveLength(1)
+    // An explicit source-safe question remains deliverable even after the generic notice was sent.
+    h.engine.report(ticketId, { ...report, publicQuestion: true })
+    expect(h.withdrawn).toContain(fallback)
+    const current = h.repo.tickets.get(ticketId)!.attention!
+    const reply = key('attention-reply', current.id)
+    expect(h.outbox.find(item => item.id === reply)?.text).toContain('Which version should we use?')
+    h.sent.add(reply)
+    h.engine.report(ticketId, { state: 'progress', summary: 'private', question: current.question })
+    expect(h.outbox.filter(item => item.id === key('attention-unverified', current.id))).toHaveLength(1)
+    h.engine.report(ticketId, { state: 'progress', summary: 'private', question: 'Another private detail?' })
+    const replacement = h.repo.tickets.get(ticketId)!.attention!
+    const replacementFallback = key('attention-unverified', replacement.id)
+    expect(h.outbox.some(item => item.id === replacementFallback)).toBe(true)
+    h.engine.report(ticketId, { state: 'progress', summary: 'private', question: null })
+    expect(h.withdrawn).toContain(replacementFallback)
+  })
+
   it('keeps an unmarked GitHub question private and does not invent one when blocked', () => {
     const h = harness()
     const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
@@ -1737,8 +1779,12 @@ describe('automatic assignment status notices', () => {
     const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
     h.settle(); h.engine.report(ticketId, { state: 'blocked', summary: 'private' })
     expect(h.outbox.filter(item => item.kind === 'reply')).toEqual([])
-    h.engine.report(ticketId, { state: 'blocked', summary: 'private', question: 'Private Feishu detail?' })
+    expect(h.outbox.at(-1)!.text).toContain('Human question: not reported.')
+    expect(h.outbox.at(-1)!.text).not.toContain('specific question needs verification')
+    h.engine.report(ticketId, { state: 'blocked', summary: 'private', question: 'Private Feishu detail?', publicStatus: { reason: 'access', next: 'investigate' } })
     expect(h.outbox.filter(item => item.kind === 'reply')).toEqual([])
+    expect(h.outbox.at(-1)!.text).toContain('The specific question needs verification; reply here to follow up.')
+    expect(h.outbox.at(-1)!.text).toContain('Next step: Investigate the issue.')
     expect(h.outbox.map(item => item.text).join(' ')).not.toContain('Private Feishu detail')
   })
 

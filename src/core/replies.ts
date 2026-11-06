@@ -44,7 +44,11 @@ export class Replies extends EnginePart {
     if (trigger.channel && trigger.human) this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId })
   }
   /** Withdraw a ticket's question for a person from the outbox, unless it went out already. */
-  withdrawAttention(attentionId: string): void { this.options.outbox.withdraw(key('attention-reply', attentionId)) }
+  withdrawAttention(attentionId: string): void {
+    this.options.outbox.withdraw(key('attention-reply', attentionId))
+    const fallback = key('attention-unverified', attentionId)
+    if (this.options.outbox.status(fallback)) this.options.outbox.withdraw(fallback)
+  }
   private acknowledge(request: Extract<ReplyRequest, { purpose: 'acknowledgement' }>): Reply {
     const ticket = this.require(request.ticketId)
     if (!liveTicket(ticket)) throw new UserError('ackEnded')
@@ -76,14 +80,21 @@ export class Replies extends EnginePart {
     // Attention replies must match the ticket's currently open question text.
     if (request.purpose === 'attention' && (!attention || attention.question !== request.question)) throw new UserError('notAttention')
     if (request.purpose === 'answer' && !trigger?.human) throw new UserError('notQuestion')
-    const id = attention ? key('attention-reply', attention.id) : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
+    // A result belongs to the assignment, not its wording: retries may rephrase it after delivery.
+    const id = attention ? key('attention-reply', attention.id)
+      : request.purpose === 'result' && ticket ? key('result-reply', ticket.id, latestAssignment(ticket)?.id ?? '')
+      : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
     const existing = this.options.outbox.status(id)
     const ready = !ticket || !trigger || ticket.answers?.includes(trigger.id)
     if (request.purpose === 'answer' && !ready && !existing) throw new UserError('noAnswer')
     const asker = attention?.triggerId ? this.repo.triggers.get(attention.triggerId) : undefined
     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
     if (!channel) throw new UserError('noChannel')
-    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {} })
+    if (attention) {
+      const fallback = key('attention-unverified', attention.id)
+      if (this.options.outbox.status(fallback)) this.options.outbox.withdraw(fallback)
+    }
+    if (!existing) this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {} })
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
       this.repo.tickets.save(ticket)

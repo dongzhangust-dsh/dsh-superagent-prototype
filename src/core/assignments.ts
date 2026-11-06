@@ -148,10 +148,19 @@ export class Assignments extends EnginePart {
     const allowed = channel?.source !== 'feishu' || (source?.source === 'feishu' && source.meta.direct === true && channel.address.direct === 'true')
     // Only an explicitly source-facing question addressed to the original human may share the attention reply key.
     // Keeping that key preserves withdrawal and lets the existing supervisor reply reuse the queued question.
-    if (report.publicQuestion && report.question && attention && source?.human && channel && allowed
-      && source.source === channel.source && (!attention.triggerId || attention.triggerId === source.id)) {
+    const publicQuestion = !!(report.publicQuestion && report.question && attention && source?.human && channel && allowed
+      && source.source === channel.source && (!attention.triggerId || attention.triggerId === source.id))
+    if (publicQuestion && attention && channel) {
+      const fallback = key('attention-unverified', attention.id)
+      if (this.options.outbox.status(fallback)) this.options.outbox.withdraw(fallback)
       const prefix = channel.source === 'github' ? 'This is by an automated agent, not a human.\n\n' : ''
       this.options.outbox.send({ id: key('attention-reply', attention.id), channel, text: prefix + attention.question, kind: 'reply', ticketId })
+    } else if (report.state === 'progress' && report.question && attention && source?.human && channel && allowed
+      && source.source === channel.source && (!attention.triggerId || attention.triggerId === source.id)
+      && !this.options.outbox.status(key('attention-reply', attention.id))) {
+      const prefix = channel.source === 'github' ? 'This is by an automated agent, not a human.\n\n' : ''
+      this.options.outbox.send({ id: key('attention-unverified', attention.id), channel,
+        text: prefix + 'A human decision is needed. The specific question needs verification; reply here to follow up.', kind: 'notice', ticketId })
     }
     // Worker summaries and logs are never copied into automatic notices; only fixed classifications are sent.
     if (notify) {
@@ -162,8 +171,12 @@ export class Assignments extends EnginePart {
         const reasons: Record<string, string> = { access: 'access', external_service: 'external service', test_failure: 'test failure', workspace: 'workspace', unknown: 'unknown' }
         const steps: Record<string, string> = { retry: 'Retry the operation.', investigate: 'Investigate the issue.', wait: 'Wait for the dependency.',
           human_response: 'A person needs to respond.', unknown: 'Check the assignment for the next step.' }
+        // Older workers may report a question without marking it safe for the source. Give a
+        // useful next step without guessing at, or publishing, the question's private content.
+        const next = report.publicStatus?.next ?? 'unknown'
+        const questionFallback = attention && !publicQuestion ? '\nThe specific question needs verification; reply here to follow up.' : ''
         const details = issue ? `\nReason category: ${reasons[report.publicStatus?.reason ?? 'unknown'] ?? 'unknown'}.\n`
-          + `Human question: ${attention ? 'reported' : 'not reported'}.\nNext step: ${steps[report.publicStatus?.next ?? 'unknown'] ?? steps.unknown}` : ''
+          + `Human question: ${attention ? 'reported' : 'not reported'}.${questionFallback}\nNext step: ${steps[next] ?? steps.unknown}` : ''
         this.options.outbox.send({ id: key('assignment-status', assignment.id, String(sequence)),
           channel, text: prefix + status + details, kind: 'notice', ticketId })
       }
