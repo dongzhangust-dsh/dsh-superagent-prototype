@@ -58,6 +58,7 @@ export const feishuKind: SourceKind<FeishuConfig> = {
   ],
   health: ['feishu', 'history'],
   scope({ meta }, config) {
+    if (meta.notificationOptIn === true) return { listened: false, reason: 'notification_opt_in' }
     if (meta.direct === true) return config.directMessages ? { listened: true, observed: false, row: 'direct' } : { listened: false, reason: 'direct_messages_not_allowed' }
     const chat = config.chats.find(item => item.chatId === meta.chatId)
     if (chat) return { listened: true, observed: chat.listen === 'all', row: chat.chatId }

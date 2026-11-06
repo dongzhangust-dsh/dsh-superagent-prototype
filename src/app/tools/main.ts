@@ -223,23 +223,15 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     tool({
       name: 'orchestrator_reply',
       description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. For purpose=attention, provide ticket_id and copy the current attention.question exactly into human_action. purpose=result needs a ticket in person/review after a ready report, a completed or merged one, or a dropped one whose matched rule asks for a closing message. IM limit: ${IM_WORDS} words.`,
-      schema: z.discriminatedUnion('purpose', [
-        z.object({
-          purpose: z.literal('attention'),
-          ticket_id: z.string().optional(),
-          human_action: z.string().trim().min(1).describe('The ticket\'s current attention question, copied exactly.'),
-          trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
-          text: z.string().min(1).max(20000),
-        }).strict(),
-        z.object({
-          purpose: z.enum(['answer', 'result']),
-          trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
-          ticket_id: z.string().optional(),
-          human_action: z.string().trim().min(1).optional(),
-          text: z.string().min(1).max(20000),
-        }).strict(),
-      ]),
+      schema: z.object({
+        purpose: z.enum(['answer', 'result', 'attention']),
+        trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
+        ticket_id: z.string().optional(),
+        human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question, copied exactly.'),
+        text: z.string().min(1).max(20000),
+      }).strict(),
       execute: async args => {
+        if (args.purpose === 'attention' && !args.human_action) throw new UserError('notAttention')
         const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
           ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
         await host.sendReplies()

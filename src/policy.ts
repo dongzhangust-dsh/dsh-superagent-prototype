@@ -189,6 +189,8 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
   return {
     version, paused: settings.paused, evalTimeoutMs: settings.eval.timeoutSeconds * 1000,
     gate(trigger: Trigger, thread, tickets) {
+      // A retained Feishu binding control message must remain non-work even if manually requeued.
+      if (trigger.source === 'feishu' && trigger.meta.notificationOptIn === true) return { admissible: false, reason: 'notification_opt_in' }
       if (!trigger.human) return machineGate(trigger)
       const allowed = allowedSender(settings, trigger.actor)
       const scope = listened(sources, trigger.source, trigger.meta)

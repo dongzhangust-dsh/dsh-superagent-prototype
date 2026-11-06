@@ -33,13 +33,15 @@ export function feishuTrigger(input: unknown, botId: string, botAppId: string): 
   if (event.sender_id === botId || event.sender_id === botAppId) return
   const direct = event.chat_type === 'p2p'
   const mentioned = event.mentions.some(mention => mention.id === botId || mention.id === botAppId)
+  // Binding control messages are retained as evidence but never assessed or routed as work.
+  const notificationOptIn = direct && event.sender_type === 'user' && /^notify github [A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/i.test(event.content.trim())
   const thread = feishuThreadId(event.chat_id, event.root_id, event.message_id)
   return { id: feishuTriggerId(event.message_id), source: SOURCE, threads: [{ source: SOURCE, id: thread }],
     actor: { source: SOURCE, id: event.sender_id }, human: event.sender_type === 'user',
     ...(direct ? { addressed: 'direct' as const } : mentioned ? { addressed: 'mention' as const } : {}),
     at: feishuTime(event.create_time), text: withMentionNames(event.content, event.mentions),
     channel: feishuChannel(event.chat_id, event.message_id, direct), ...(event.message_app_link ? { url: event.message_app_link } : {}),
-    meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned, ...(event.root_id ? { rootId: event.root_id } : {}),
+    meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned, ...(notificationOptIn ? { notificationOptIn: true } : {}), ...(event.root_id ? { rootId: event.root_id } : {}),
       ...(event.parent_id ? { parentId: event.parent_id } : {}), ...(event.thread_id ? { threadId: event.thread_id } : {}) } }
 }
 export const feishuParent = (trigger: Trigger): string | undefined =>

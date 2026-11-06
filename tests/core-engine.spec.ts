@@ -1658,17 +1658,38 @@ describe('read claims review: restarts', () => {
   })
 })
 describe('automatic assignment status notices', () => {
-  it('queues one fixed notice per blocked or failed transition without exposing worker text', () => {
+  it('deduplicates identical reports and sends changed reason and recovery even at the same timestamp', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
-    h.engine.report(ticketId, { state: 'blocked', summary: 'private worker text' })
-    h.engine.report(ticketId, { state: 'blocked', summary: 'updated private text' })
-    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({
-      channel: trigger('1').channel, text: 'The assignment is blocked.', ticketId,
-    })])
-    h.tick(1); h.engine.report(ticketId, { state: 'failed', summary: 'secret error' })
-    expect(h.outbox.filter(item => item.kind === 'notice').map(item => item.text))
-      .toEqual(['The assignment is blocked.', 'The assignment failed.'])
+    const report = { state: 'blocked' as const, summary: 'private worker text', publicStatus: { reason: 'access' as const, next: 'investigate' as const } }
+    h.engine.report(ticketId, report); h.engine.report(ticketId, report)
+    expect(h.repo.tickets.get(ticketId)!.assignments.at(-1)!.report?.publicStatus).toEqual(report.publicStatus)
+    h.engine.report(ticketId, { ...report, summary: 'a different private summary' })
+    expect(h.outbox.filter(item => item.kind === 'notice')).toHaveLength(1)
+    h.engine.report(ticketId, { ...report, summary: 'updated private text', publicStatus: { reason: 'test_failure', next: 'retry' } })
+    h.engine.report(ticketId, { state: 'progress', summary: 'working again' })
+    h.engine.report(ticketId, report)
+    const notices = h.outbox.filter(item => item.kind === 'notice')
+    expect(notices).toHaveLength(4)
+    expect(notices[0]!.text).toContain('Reason category: access.')
+    expect(notices[1]!.text).toContain('Reason category: test failure.')
+    expect(notices[2]!.text).toBe('Work on the assignment has resumed.')
+    expect(notices.map(item => item.text).join(' ')).not.toContain('private')
+    expect(new Set(notices.map(item => item.id)).size).toBe(4)
+  })
+
+  it('keeps transition identity across an interruption and reports readiness', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const report = { state: 'failed' as const, summary: 'private error' }
+    h.engine.report(ticketId, report)
+    h.engine.assignmentInterrupted(ticketId, runningAssignment(h.repo.tickets.get(ticketId)!)!.id)
+    h.engine.report(ticketId, report)
+    expect(h.outbox.filter(item => item.kind === 'notice')).toHaveLength(1)
+    h.engine.report(ticketId, { state: 'ready', summary: 'private result' })
+    expect(h.outbox.filter(item => item.kind === 'notice').map(item => item.text)).toEqual([
+      expect.stringContaining('The assignment failed.'), 'The assignment is ready.',
+    ])
   })
 
   it('uses the required GitHub prefix and never copies private report text', () => {
@@ -1679,14 +1700,54 @@ describe('automatic assignment status notices', () => {
     const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
     h.settle(); h.engine.report(ticketId, { state: 'failed', summary: 'private Feishu content' })
     expect(h.outbox.find(item => item.kind === 'notice')).toMatchObject({ channel: source.channel,
-      text: 'This is by an automated agent, not a human.\n\nThe assignment failed.' })
+      text: 'This is by an automated agent, not a human.\n\nThe assignment failed.\nReason category: unknown.\nHuman question: not reported.\nNext step: Check the assignment for the next step.' })
   })
 
   it('notifies on a blocked report with an attention question without exposing it', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'blocked', summary: 'blocked', question: 'Which page?' })
-    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({ text: 'The assignment is blocked.' })])
+    expect(h.outbox.filter(item => item.kind === 'notice')).toEqual([expect.objectContaining({ text: expect.stringContaining('Human question: reported.') })])
+  })
+
+  it('sends an explicitly public source question once using the existing attention key', () => {
+    const h = harness()
+    const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+      channel: { source: 'github', thread: '12', address: { number: '12' } } })
+    h.engine.receive(source); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
+    h.settle()
+    const question = 'Which supported version should we use?'
+    const report = { state: 'blocked' as const, summary: 'private', question, publicQuestion: true }
+    const attention = h.engine.report(ticketId, report).attention!
+    h.engine.report(ticketId, report)
+    const replies = () => h.outbox.filter(item => item.id === key('attention-reply', attention.id))
+    expect(replies()).toEqual([expect.objectContaining({ channel: source.channel,
+      text: 'This is by an automated agent, not a human.\n\n' + question })])
+    h.engine.reply({ purpose: 'attention', ticketId, question, text: 'Supervisor question' })
+    expect(replies()).toHaveLength(1)
+    expect(replies()[0]!.text).not.toContain('Supervisor question')
+  })
+
+  it('keeps an unmarked GitHub question private and does not invent one when blocked', () => {
+    const h = harness()
+    const source = trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+      channel: { source: 'github', thread: '12', address: { number: '12' } } })
+    h.engine.receive(source); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'small', reason: 'requested' }).ticketId!
+    h.settle(); h.engine.report(ticketId, { state: 'blocked', summary: 'private' })
+    expect(h.outbox.filter(item => item.kind === 'reply')).toEqual([])
+    h.engine.report(ticketId, { state: 'blocked', summary: 'private', question: 'Private Feishu detail?' })
+    expect(h.outbox.filter(item => item.kind === 'reply')).toEqual([])
+    expect(h.outbox.map(item => item.text).join(' ')).not.toContain('Private Feishu detail')
+  })
+
+  it('does not publish a question addressed to a different human trigger', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.receive(trigger('2')); h.settle()
+    h.engine.report(ticketId, { state: 'blocked', summary: 'private', question: 'Private question?', askedBy: '2', publicQuestion: true })
+    expect(h.outbox.filter(item => item.kind === 'reply')).toEqual([])
   })
 
   it('does not send automatic notices to Feishu groups or unverified direct channels', () => {

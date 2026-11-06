@@ -13,6 +13,10 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /** Called inside the report transaction after a successful report. */
+  reported?: (before: Ticket, after: Ticket) => void
+  /** Called inside the terminal unavailable Eval transaction for an explicit human request. */
+  evalUnavailable?: (trigger: Trigger, evalId: string) => void
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

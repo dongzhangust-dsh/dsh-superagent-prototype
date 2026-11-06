@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, runningAssignment, waitsForPerson } from './model.ts'
-import type { ReportState, Ticket } from './model.ts'
+import type { PublicStatus, ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
@@ -11,6 +11,10 @@ import { automatic, type Tickets } from './tickets.ts'
 export interface WorkerReport {
   state: ReportState
   summary: string
+  /** Public, bounded status classifications; never put report text or logs in these fields. */
+  publicStatus?: PublicStatus
+  /** The worker explicitly designates this question for publication to its original source. */
+  publicQuestion?: boolean
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
@@ -112,6 +116,8 @@ export class Assignments extends EnginePart {
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
     const at = this.now()
     const priorReport = assignment.report
+    const priorStatus = priorReport
+    const precedingReport = priorReport ?? ticket.assignments.slice(0, -1).reverse().find(item => item.report)?.report
     const wasWaiting = waitsForPerson(ticket)
     const previous = ticket.attention
     const ask = (question: string) => ({ id: key('attention', ticketId, question, at, previous?.id ?? ''), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
@@ -121,24 +127,45 @@ export class Assignments extends EnginePart {
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
-    assignment.report = { state: report.state, summary: report.summary, at }
+    const signature = key(report.state, attention?.id ?? '', report.publicStatus?.reason ?? 'unknown', report.publicStatus?.next ?? 'unknown')
+    const issue = report.state === 'blocked' || report.state === 'failed'
+    const recovered = report.state === 'progress' && (precedingReport?.state === 'blocked' || precedingReport?.state === 'failed')
+    const notify = (issue && (priorStatus?.noticeSignature !== signature || !wasWaiting)) || recovered
+      || (report.state === 'ready' && priorStatus?.noticeSignature !== signature)
+    const sequence = (priorStatus?.noticeSequence ?? 0) + (notify ? 1 : 0)
+    // The sequence survives restarts and distinguishes repeated transitions even when the clock does not advance.
+    assignment.report = { state: report.state, summary: report.summary, at, noticeSequence: sequence,
+      ...(report.publicStatus ? { publicStatus: report.publicStatus } : {}),
+      ...(notify ? { noticeSignature: signature } : priorStatus?.noticeSignature ? { noticeSignature: priorStatus.noticeSignature } : {}) }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
     if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
-    // Worker text has no destination-specific provenance, so it is never copied into an automatic notice.
-    if ((report.state === 'blocked' || report.state === 'failed')
-      && (!wasWaiting || priorReport?.state !== report.state)) {
-      const source = this.source(ticket)
-      const channel = source?.channel
-      // Feishu group conversations are not authorized for unsolicited status messages.
-      const allowed = channel?.source !== 'feishu' || (source?.source === 'feishu' && source.meta.direct === true && channel.address.direct === 'true')
+    const source = this.source(ticket)
+    const channel = source?.channel
+    // Feishu group conversations are not authorized for unsolicited status messages.
+    const allowed = channel?.source !== 'feishu' || (source?.source === 'feishu' && source.meta.direct === true && channel.address.direct === 'true')
+    // Only an explicitly source-facing question addressed to the original human may share the attention reply key.
+    // Keeping that key preserves withdrawal and lets the existing supervisor reply reuse the queued question.
+    if (report.publicQuestion && report.question && attention && source?.human && channel && allowed
+      && source.source === channel.source && (!attention.triggerId || attention.triggerId === source.id)) {
+      const prefix = channel.source === 'github' ? 'This is by an automated agent, not a human.\n\n' : ''
+      this.options.outbox.send({ id: key('attention-reply', attention.id), channel, text: prefix + attention.question, kind: 'reply', ticketId })
+    }
+    // Worker summaries and logs are never copied into automatic notices; only fixed classifications are sent.
+    if (notify) {
       if (channel && allowed) {
         const prefix = channel.source === 'github' ? 'This is by an automated agent, not a human.\n\n' : ''
-        const text = report.state === 'blocked' ? 'The assignment is blocked.' : 'The assignment failed.'
-        this.options.outbox.send({ id: key('assignment-status', assignment.id, report.state, at, priorReport?.at ?? ''),
-          channel, text: prefix + text, kind: 'notice', ticketId })
+        const status = report.state === 'blocked' ? 'The assignment is blocked.' : report.state === 'failed' ? 'The assignment failed.'
+          : report.state === 'ready' ? 'The assignment is ready.' : 'Work on the assignment has resumed.'
+        const reasons: Record<string, string> = { access: 'access', external_service: 'external service', test_failure: 'test failure', workspace: 'workspace', unknown: 'unknown' }
+        const steps: Record<string, string> = { retry: 'Retry the operation.', investigate: 'Investigate the issue.', wait: 'Wait for the dependency.',
+          human_response: 'A person needs to respond.', unknown: 'Check the assignment for the next step.' }
+        const details = issue ? `\nReason category: ${reasons[report.publicStatus?.reason ?? 'unknown'] ?? 'unknown'}.\n`
+          + `Human question: ${attention ? 'reported' : 'not reported'}.\nNext step: ${steps[report.publicStatus?.next ?? 'unknown'] ?? steps.unknown}` : ''
+        this.options.outbox.send({ id: key('assignment-status', assignment.id, String(sequence)),
+          channel, text: prefix + status + details, kind: 'notice', ticketId })
       }
     }
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.

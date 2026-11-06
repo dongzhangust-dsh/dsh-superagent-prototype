@@ -18,8 +18,6 @@ export interface ExecutorToolsHost {
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
   sendReplies(): Promise<void>
-  /** Queue a private status notice in the report transaction when configured. */
-  privateReportNotice?(before: Ticket, after: Ticket): void
 }
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
@@ -79,11 +77,16 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       schema: z.object({
         state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
         summary: z.string().min(1),
+        public_status: z.object({
+          reason: z.enum(['access', 'external_service', 'test_failure', 'workspace', 'unknown']),
+          next: z.enum(['retry', 'investigate', 'wait', 'human_response', 'unknown']),
+        }).strict().optional().describe('Safe public classifications for blocked or failed status. Use unknown when uncertain; never put report text, logs, or private information here.'),
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
+        public_question: z.boolean().optional().describe('Set true only when human_action is intended for the original source and contains no private information, including private Feishu content. This requests an automatic source reply; other questions use the existing attention flow.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
-      }).strict(),
+      }).strict().refine(args => !args.public_question || !!args.human_action, 'public_question requires human_action'),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
@@ -92,12 +95,12 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
-          const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+          const report = { state: args.state, summary: args.summary, ...(args.public_status ? { publicStatus: args.public_status } : {}),
+            ...(args.public_question ? { publicQuestion: true } : {}),
+            ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
-          const before = host.privateReportNotice ? structuredClone(host.store.tickets.get(ticketId)!) : undefined
           const updated = host.engine.report(ticketId, report)
-          if (before) host.privateReportNotice?.(before, updated)
           const relay = reportRelay(updated, report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'

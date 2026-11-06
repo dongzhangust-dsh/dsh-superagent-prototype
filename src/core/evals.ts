@@ -318,7 +318,10 @@ export class Evals extends EnginePart {
     const text = trigger.source === 'github' ? 'This is by an automated agent, not a human.\n\nI could not assess this request. Please try again later.'
       : trigger.source === 'feishu' && trigger.meta.direct === true && trigger.channel.address.direct === 'true'
         ? '抱歉，暂时无法处理这条请求。请稍后重试。' : undefined
-    if (text) this.options.outbox.send({ id: key('eval-timeout', evaluation.id), channel: trigger.channel, kind: 'reply', text })
+    if (text) {
+      this.options.outbox.send({ id: key('eval-timeout', evaluation.id), channel: trigger.channel, kind: 'reply', text })
+      this.options.evalUnavailable?.(trigger, evaluation.id)
+    }
   }
   /** Record an accept with the Mandate the Eval gives, and have Tickets create its ticket. */
   private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Decision {

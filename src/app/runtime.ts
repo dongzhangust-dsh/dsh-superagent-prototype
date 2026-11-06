@@ -134,20 +134,23 @@ export class Runtime extends Service implements SourceHost {
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused() })
-      const privateNotice = (ticket: Ticket, eventId: string, text: string) => {
-        const origin = store.triggers.get(ticket.origin.triggerId)
+      const privateNotice = (origin: Trigger | undefined, eventId: string, text: string, ticketId?: string) => {
         if (!origin || origin.source !== 'github' || origin.actor.source !== 'github' || !origin.human || !setup.configured()
           || !Number.isSafeInteger(origin.meta.number) || Number(origin.meta.number) <= 0
           || !sources.scope(origin).listened || !sources.instance('feishu')?.enabled) return
         const url = githubPage(setup.deployment.repository, Number(origin.meta.number), origin.meta.isPr === true)
         const message = feishuPrivateNotice(feishuSettings(sources), id => store.triggers.get(id), origin.actor.id, eventId,
-          `[GitHub #${origin.meta.number}](${url}) ${text}.`, ticket.id)
+          `[GitHub #${origin.meta.number}](${url}) ${text}.`, ticketId)
         if (message) outbox.send(message)
       }
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
-        outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
+        outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), reported: (before, after) => {
+          const status = feishuReportStatus(before, after)
+          if (status) privateNotice(store.triggers.get(after.origin.triggerId), status.id, status.text, after.id)
+        }, evalUnavailable: (trigger, evalId) => privateNotice(trigger, key('eval-unavailable', evalId), 'could not be assessed; please try again later'),
+        emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
           const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
@@ -158,7 +161,7 @@ export class Runtime extends Service implements SourceHost {
           if (followup) sessions.relay(followup.id, followup.text)
           if (event.type === 'ticket.resumed') {
             const ticket = store.tickets.get(event.data.ticketId)
-            if (ticket) privateNotice(ticket, key('resumed', ticket.id, event.data.triggerId), 'has resumed')
+            if (ticket) privateNotice(store.triggers.get(ticket.origin.triggerId), key('resumed', ticket.id, event.data.triggerId), 'has resumed', ticket.id)
           }
           // Notify the ticket's conversations whenever it ends via a pull request.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
@@ -178,10 +181,6 @@ export class Runtime extends Service implements SourceHost {
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
-        privateReportNotice: (before, after) => {
-          const status = feishuReportStatus(before, after)
-          if (status) privateNotice(after, status.id, status.text)
-        },
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
       this.ready = this.initialize()
     } catch (error) {

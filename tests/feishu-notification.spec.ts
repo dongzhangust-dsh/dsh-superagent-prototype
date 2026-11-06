@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { feishuKind } from '../src/sources/feishu.ts'
-import { feishuPrivateNotice } from '../src/sources/feishu-notification.ts'
+import { feishuPrivateNotice, feishuReportStatus } from '../src/sources/feishu-notification.ts'
+import type { Ticket } from '../src/core/index.ts'
 import { feishuTrigger } from '../src/sources/feishu-trigger.ts'
 
 const config = feishuKind.schema.parse({ notificationBindings: [{ github: 'alice', openId: 'ou_alice', messageId: 'om_consent' }] })
@@ -20,6 +21,13 @@ describe('private Feishu notifications', () => {
     expect(route({ ...event, message_id: 'om_other' })).toBeUndefined()
     expect(feishuPrivateNotice(config, () => undefined, 'alice', 'event-1', 'x')).toBeUndefined()
     expect(feishuPrivateNotice(config, () => feishuTrigger(event, 'ou_bot', 'cli_bot'), 'bob', 'event-1', 'x')).toBeUndefined()
+  })
+  it('does not repeat a recovery already announced on ticket resumption', () => {
+    const before = { id: 'ticket', assignments: [{ report: { state: 'blocked', at: '2026-01-01T00:00:00.000Z' } }],
+      inputs: [{ kind: 'resumed', at: '2026-01-01T00:00:01.000Z' }] } as Ticket
+    const after = { ...before, assignments: [{ report: { state: 'progress', at: '2026-01-01T00:00:02.000Z' } }] } as Ticket
+    expect(feishuReportStatus(before, after)).toBeUndefined()
+    expect(feishuReportStatus({ ...before, inputs: [] }, after)?.text).toBe('has resumed')
   })
   it('rechecks the binding and direct message setting when delivering', () => {
     const notice = route()!

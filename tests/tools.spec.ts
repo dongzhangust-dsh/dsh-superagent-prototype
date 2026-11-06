@@ -16,12 +16,12 @@ const words = (count: number) => Array.from({ length: count }, () => 'word').joi
 const read = (resource: string, page: { offset?: number; limit?: number } = {}) =>
   h.runTool(h.runtime.masterId, 'orchestrator_read', { resource, ...page })
 
-it('exposes human_action as required for attention in the reply tool schema', () => {
+it('exposes an object reply schema with the attention requirement described', () => {
   const reply = h.tools.get(h.runtime.masterId)!.get('orchestrator_reply') as unknown as {
-    parameters: { oneOf?: { properties: { purpose: { const?: string } }; required: string[] }[] }
+    parameters: { type: string; properties: { human_action: { description: string } } }
   }
-  const attention = reply.parameters.oneOf?.find(branch => branch.properties.purpose.const === 'attention')
-  expect(attention?.required).toContain('human_action')
+  expect(reply.parameters.type).toBe('object')
+  expect(reply.parameters.properties.human_action.description).toContain('Required for attention')
 })
 
 it('reads the lists, a ticket, a decision, the settings, the prompts and the models as resources', async () => {

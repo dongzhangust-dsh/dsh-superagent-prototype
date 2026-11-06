@@ -214,6 +214,11 @@ export type AssignmentState = 'pending' | 'running' | 'ended'
  * ready (`ready`), a person must act to unblock or recover it (`blocked` or `failed`), or nothing is left to do (`dropped`).
  */
 export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
+/** Bounded, public classifications of an issue and its next action; contains no free-form text. */
+export interface PublicStatus {
+  reason: 'access' | 'external_service' | 'test_failure' | 'workspace' | 'unknown'
+  next: 'retry' | 'investigate' | 'wait' | 'human_response' | 'unknown'
+}
 /** Binding between a ticket and one executor instance. */
 export interface Assignment {
   id: string
@@ -222,7 +227,9 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string }
+  report?: { state: ReportState; summary: string; at: string; publicStatus?: PublicStatus
+    /** Monotonic per-assignment notice sequence and last public transition fingerprint, persisted across restarts. */
+    noticeSequence?: number; noticeSignature?: string }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**

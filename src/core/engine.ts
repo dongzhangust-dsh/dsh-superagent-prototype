@@ -236,7 +236,15 @@ export class Engine {
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question that comes with a ready result or an
    * answer, or a question or answer that names a message that is not a person's or did not reach the ticket.
    */
-  report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
+  report(ticketId: string, report: WorkerReport): Ticket {
+    return this.repo.atomic(() => {
+      const current = this.options.reported && this.repo.tickets.get(ticketId)
+      const before = current && structuredClone(current)
+      const after = this.assignments.report(ticketId, report)
+      if (before) this.options.reported?.(before, after)
+      return after
+    })
+  }
   /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
